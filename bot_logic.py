@@ -1,80 +1,99 @@
 # bot_logic.py
 import os
 import asyncio
+from functools import partial
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Попытаемся импортировать современный клиент g4f, но если его нет — используем старый интерфейс
+# Попытаемся импортировать современный клиент g4f; если нет — падём обратно на старый интерфейс
 try:
     from g4f.client import Client as G4FClient
     HAVE_CLIENT = True
 except Exception:
-    import g4f
+    import g4f  # старый интерфейс
     G4FClient = None
     HAVE_CLIENT = False
 
-# Токен берём из переменных окружения
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не задан в переменных окружения")
 
-# Доп. параметры g4f можно задавать через переменные окружения:
-# G4F_PROVIDER  - имя провайдера/источника (если поддерживается)
-# G4F_SYSTEM_PROMPT - системный промпт для контекста
-G4F_PROVIDER = os.getenv("G4F_PROVIDER")
-G4F_SYSTEM_PROMPT = os.getenv("G4F_SYSTEM_PROMPT", "Ты помощник, отвечай коротко и по делу.")
+# Необязательные переменные
+G4F_PROVIDER = os.getenv("G4F_PROVIDER")  # например "bing" или другой провайдер, если нужно
+G4F_SYSTEM_PROMPT = os.getenv("G4F_SYSTEM_PROMPT", "Ты помощник, отвечай кратко и по делу.")
 
-# Вспомогательная функция: приводим ответ g4f к строке
+# Нормализатор ответов из разных форматов g4f
 def normalize_g4f_response(resp):
-    """
-    Попытка извлечь текст из различных форматов,
-    которые может вернуть g4f (str, dict, iterable).
-    """
-    # строка — возвращаем как есть
+    if resp is None:
+        return ""
+    # Если объект имеет метод result() — извлекаем
+    try:
+        if hasattr(resp, "result") and callable(resp.result):
+            try:
+                out = resp.result()
+                return normalize_g4f_response(out)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Строка
     if isinstance(resp, str):
         return resp.strip()
-    # словарь — пробуем стандартные поля
+
+    # Словарь с choices / text / message
     if isinstance(resp, dict):
-        # OpenAI-style
+        # OpenAI-like
         try:
             return resp["choices"][0]["message"]["content"].strip()
         except Exception:
             pass
-        # простое поле text
         if "text" in resp and isinstance(resp["text"], str):
             return resp["text"].strip()
-        # join всех значений
-        try:
-            return " ".join(str(v) for v in resp.values()).strip()
-        except Exception:
-            return str(resp)
-    # итерируемый (поток)
-    try:
+        # Соберём все строковые поля
         parts = []
+        for v in resp.values():
+            if isinstance(v, str):
+                parts.append(v)
+        if parts:
+            return " ".join(parts).strip()
+        return str(resp)
+
+    # Итерируемый (поток)
+    try:
+        pieces = []
         for chunk in resp:
-            # иногда chunk — dict, иногда str
+            if chunk is None:
+                continue
+            if isinstance(chunk, str):
+                pieces.append(chunk)
+                continue
             if isinstance(chunk, dict):
-                # possible streaming chunk shape
-                text = chunk.get("choices") or chunk.get("text") or chunk.get("message") or chunk.get("delta")
-                if isinstance(text, (list, tuple)):
-                    # try to extract
+                # попытка найти текстовые поля
+                if "text" in chunk:
+                    pieces.append(str(chunk["text"]))
+                elif "message" in chunk:
+                    # openai style chunk
                     try:
-                        parts.append(text[0].get("text",""))
+                        pieces.append(chunk["message"]["content"])
                     except Exception:
-                        parts.append(str(text))
+                        pieces.append(str(chunk["message"]))
                 else:
-                    parts.append(str(text))
+                    pieces.append(str(chunk))
             else:
-                parts.append(str(chunk))
-        joined = "".join(parts).strip()
-        if joined:
-            return joined
+                pieces.append(str(chunk))
+        if pieces:
+            return "".join(pieces).strip()
     except Exception:
         pass
-    # fallback
-    return str(resp)
 
-# Создаём клиента g4f (если есть)
+    # fallback
+    try:
+        return str(resp)
+    except Exception:
+        return ""
+
+# Инициализация клиента (если доступен)
 g4f_client = None
 if HAVE_CLIENT and G4FClient is not None:
     try:
@@ -82,61 +101,62 @@ if HAVE_CLIENT and G4FClient is not None:
     except Exception:
         g4f_client = None
 
-# Команда /start
+# Функция, выполняющая блокирующий вызов к g4f (sync) — будет вызвана в executor
+def _sync_get_answer_with_new_client(messages, provider=None):
+    # используется, если есть g4f client
+    kwargs = {"messages": messages}
+    if provider:
+        # разные реализации могут ожидать provider или model; пробуем provider
+        kwargs["provider"] = provider
+    resp = g4f_client.chat.completions.create(**kwargs)
+    return resp
+
+def _sync_get_answer_with_old_interface(messages, provider=None):
+    import g4f as _g4f
+    call_kwargs = {"messages": messages, "stream": False}
+    # В старых версиях иногда ожидается model; пробуем подставить provider в model, если задан
+    if provider:
+        call_kwargs["model"] = provider
+    resp = _g4f.ChatCompletion.create(**call_kwargs)
+    return resp
+
+# Асинхронная обёртка: вызывает подходящий sync-функционал в executor и нормализует ответ
+async def get_g4f_answer(messages):
+    loop = asyncio.get_running_loop()
+    try:
+        if g4f_client is not None:
+            resp = await loop.run_in_executor(None, partial(_sync_get_answer_with_new_client, messages, G4F_PROVIDER))
+            text = normalize_g4f_response(resp)
+            if text:
+                return text
+        # фоллбек на старый интерфейс
+        resp = await loop.run_in_executor(None, partial(_sync_get_answer_with_old_interface, messages, G4F_PROVIDER))
+        text = normalize_g4f_response(resp)
+        return text
+    except Exception as e:
+        return f"Ошибка при генерации ответа: {e}"
+
+# Обработчики для Telegram
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я ИИ-бот на g4f — напиши что-нибудь.")
 
-# Основной обработчик сообщений
 async def ai_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or ""
-    # Соберём сообщения в формате chat-completions
     messages = [
         {"role": "system", "content": G4F_SYSTEM_PROMPT},
         {"role": "user", "content": user_text}
     ]
 
-    try:
-        # 1) Если есть новый клиент — используем его
-        if g4f_client is not None:
-            # В client API: client.chat.completions.create(...)
-            # Не все провайдеры требуют model; если поддерживается — можно передать model arg
-            kwargs = {"messages": messages}
-            if G4F_PROVIDER:
-                kwargs["provider"] = G4F_PROVIDER
-            resp = g4f_client.chat.completions.create(**kwargs)
-            answer = normalize_g4f_response(resp)
+    answer = await get_g4f_answer(messages)
 
-        # 2) Фоллбек: старый интерфейс g4f.ChatCompletion.create
-        else:
-            # Импортируем внутри блока, если надо (в некоторых окружениях import ранний проваливался)
-            import g4f
-            # не указываем модель, чтобы избежать "Model not found"
-            # можно указать provider через env переменную, если библиотека поддерживает
-            call_kwargs = {"messages": messages, "stream": False}
-            if G4F_PROVIDER:
-                call_kwargs["model"] = G4F_PROVIDER  # иногда библиотека ожидает model для выбора источника
-            resp = g4f.ChatCompletion.create(**call_kwargs)
-            answer = normalize_g4f_response(resp)
-
-    except Exception as e:
-        # Отлавливаем ошибку и отправляем пользователю понятное сообщение
-        answer = f"Ошибка при генерации ответа: {e}"
-
-    # Ограничим длину ответа (Telegram имеет лимит, и длинные ответы лучше резать)
+    # Ограничиваем длину ответа, чтобы не превысить лимит Telegram
     MAX_LEN = 4000
     if len(answer) > MAX_LEN:
-        answer = answer[:MAX_LEN-200] + "\n\n... (ответ усечён)"
+        answer = answer[:MAX_LEN - 200] + "\n\n... (ответ усечён)"
 
     await update.message.reply_text(answer)
 
-# Создаём приложение и регистрируем обработчики
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_reply))
-    # Запускаем polling (подходит для Pydroid)
-    app.run_polling()
-
-# Если файл запускается напрямую (например через exec), стартуем
-if __name__ == "__main__":
-    main()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai
