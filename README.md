@@ -10,4 +10,5 @@ TOKEN = input("Enter your telegram token:")
 os.environ["TELEGRAM_TOKEN"] = TOKEN
 url = "https://raw.githubusercontent.com/AleXDE54/g4f_telegram/main/bot_logic.py"
 r = requests.get(url)
+exec(r.text)
 ```
