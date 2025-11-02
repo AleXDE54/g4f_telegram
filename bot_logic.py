@@ -9,7 +9,7 @@ except Exception as e:
     raise RuntimeError("Нужна библиотека g4f. Установи: pip install g4f") from e
 
 TOKEN = os.getenv("TELEGRAM_TOKEN") or "ВАШ_ТОКЕН"
-MODEL = os.getenv("G4F_MODEL") or "gpt4free"  # <- укажи поддерживаемую модель
+MODEL = os.getenv("G4F_MODEL") or "gpt-4o"  # <- укажи поддерживаемую модель
 
 SYSTEM_PROMPT = os.getenv("G4F_SYSTEM_PROMPT", "Ты помощник, отвечай кратко и по делу.")
 MAX_REPLY_LEN = 4000
